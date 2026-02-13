@@ -3,6 +3,7 @@
 // from the Intel 82540EP/EM &c manual.
 //
 
+
 /* Registers */
 #define E1000_CTL      (0x00000/4)  /* Device Control Register - RW */
 #define E1000_ICR      (0x000C0/4)  /* Interrupt Cause Read - R */

@@ -19,11 +19,39 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+#define NUDPPORT 64
+#define UDPQSIZE 16
+
+struct udp_packet {
+  uint32 src;
+  uint16 sport;
+  int len;
+  char data[512];
+};
+
+struct udp_queue {
+  struct spinlock lock;
+  int bound;
+  struct udp_packet pkts[UDPQSIZE];
+  int r;
+  int w;
+};
+
+static struct udp_queue udp_ports[NUDPPORT];
+
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+
+  for(int i = 0; i < NUDPPORT; i++){
+    initlock(&udp_ports[i].lock, "udpq");
+    udp_ports[i].bound = 0;
+    udp_ports[i].r = 0;
+    udp_ports[i].w = 0;
+  }
 }
+
 
 
 //
@@ -34,12 +62,21 @@ netinit(void)
 uint64
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
+  int port;
+  argint(0, &port);
 
-  return -1;
+  if(port < 0 || port >= NUDPPORT)
+    return -1;
+
+  acquire(&udp_ports[port].lock);
+  udp_ports[port].bound = 1;
+  udp_ports[port].r = 0;
+  udp_ports[port].w = 0;
+  release(&udp_ports[port].lock);
+
+  return 0;
 }
+
 
 //
 // unbind(int port)
@@ -49,12 +86,25 @@ sys_bind(void)
 uint64
 sys_unbind(void)
 {
-  //
-  // Optional: Your code here.
-  //
+  int port;
+  argint(0, &port);
+
+  if(port < 0 || port >= NUDPPORT)
+    return -1;
+
+  struct udp_queue *q = &udp_ports[port];
+
+  acquire(&q->lock);
+
+  q->w = 0;
+
+  q->bound = 0;
+
+  release(&q->lock);
 
   return 0;
 }
+
 
 //
 // recv(int dport, int *src, short *sport, char *buf, int maxlen)
@@ -74,11 +124,49 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  return -1;
+  int dport;
+  uint64 srcaddr, sportaddr, bufaddr;
+  int maxlen;
+
+  argint(0, &dport);
+  argaddr(1, &srcaddr);
+  argaddr(2, &sportaddr);
+  argaddr(3, &bufaddr);
+  argint(4, &maxlen);
+
+  if(dport < 0 || dport >= NUDPPORT)
+    return -1;
+
+  struct udp_queue *q = &udp_ports[dport];
+
+  acquire(&q->lock);
+
+  while(q->r == q->w){
+    sleep(q, &q->lock);
+  }
+
+  struct udp_packet *p = &q->pkts[q->r % UDPQSIZE];
+  q->r++;
+
+  release(&q->lock);
+
+  struct proc *pr = myproc();
+
+  if(copyout(pr->pagetable, srcaddr, (char*)&p->src, sizeof(p->src)) < 0)
+    return -1;
+
+  if(copyout(pr->pagetable, sportaddr, (char*)&p->sport, sizeof(p->sport)) < 0)
+    return -1;
+
+  int n = p->len;
+  if(n > maxlen) n = maxlen;
+
+  if(copyout(pr->pagetable, bufaddr, p->data, n) < 0)
+    return -1;
+
+  return n;
 }
+
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
 // of the University of California.
@@ -179,20 +267,89 @@ sys_send(void)
   return 0;
 }
 
+
 void
 ip_rx(char *buf, int len)
 {
-  // don't delete this printf; make grade depends on it.
   static int seen_ip = 0;
   if(seen_ip == 0)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
 
-  //
-  // Your code here.
-  //
-  
+  if(len < sizeof(struct eth) + sizeof(struct ip)){
+    kfree(buf);
+    return;
+  }
+
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+
+  if(ip->ip_p != IPPROTO_UDP){
+    kfree(buf);
+    return;
+  }
+
+  int ip_hlen = (ip->ip_vhl & 0x0f) * 4;
+  if(ip_hlen < 20){
+    kfree(buf);
+    return;
+  }
+
+  if(len < sizeof(struct eth) + ip_hlen + sizeof(struct udp)){
+    kfree(buf);
+    return;
+  }
+
+  struct udp *udp = (struct udp *)((char *)ip + ip_hlen);
+
+  uint16 dport = ntohs(udp->dport);
+  uint16 sport = ntohs(udp->sport);
+
+  if(dport >= NUDPPORT){
+    kfree(buf);
+    return;
+  }
+
+  struct udp_queue *q = &udp_ports[dport];
+
+  acquire(&q->lock);
+
+  if(q->bound == 0){
+    release(&q->lock);
+    kfree(buf);
+    return;
+  }
+
+  if(q->w - q->r >= UDPQSIZE){
+    release(&q->lock);
+    kfree(buf);
+    return;
+  }
+
+  struct udp_packet *p = &q->pkts[q->w % UDPQSIZE];
+
+  p->src = ntohl(ip->ip_src);
+  p->sport = sport;
+
+  int plen = ntohs(udp->ulen) - sizeof(struct udp);
+  if(plen < 0) plen = 0;
+  if(plen > sizeof(p->data)) plen = sizeof(p->data);
+
+  memmove(p->data, (char *)(udp + 1), plen);
+  p->len = plen;
+
+  q->w++;
+
+  wakeup(q);
+
+  release(&q->lock);
+
+  kfree(buf);
 }
+
+
+
+
 
 //
 // send an ARP reply packet to tell qemu to map

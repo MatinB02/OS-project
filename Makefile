@@ -196,7 +196,9 @@ UPROGS=\
 	$U/_logstress\
 	$U/_forphan\
 	$U/_dorphan\
-
+	$U/_TXonly\
+	$U/_step5\
+	$U/_bindTest\
 
 
 ifeq ($(LAB),util)
@@ -328,7 +330,7 @@ QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
 ifeq ($(LAB),net)
-QEMUOPTS += -netdev user,id=net0,hostfwd=udp::$(FWDPORT1)-:2000,hostfwd=udp::$(FWDPORT2)-:2001 -object filter-dump,id=net0,netdev=net0,file=packets.pcap
+QEMUOPTS += -netdev user,id=net0,hostfwd=udp::$(FWDPORT1)-:10,hostfwd=udp::$(FWDPORT2)-:11 -object filter-dump,id=net0,netdev=net0,file=packets.pcap
 QEMUOPTS += -device e1000,netdev=net0,bus=pcie.0
 endif
 

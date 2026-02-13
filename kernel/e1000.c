@@ -13,6 +13,10 @@ static struct tx_desc tx_ring[TX_RING_SIZE] __attribute__((aligned(16)));
 #define RX_RING_SIZE 16
 static struct rx_desc rx_ring[RX_RING_SIZE] __attribute__((aligned(16)));
 
+static char *tx_bufs[TX_RING_SIZE];
+static char *rx_bufs[RX_RING_SIZE];
+
+
 // remember where the e1000's registers live.
 static volatile uint32 *regs;
 
@@ -44,6 +48,7 @@ e1000_init(uint32 *xregs)
     tx_ring[i].status = E1000_TXD_STAT_DD;
     tx_ring[i].addr = 0;
   }
+  memset(tx_bufs, 0, sizeof(tx_bufs));
   regs[E1000_TDBAL] = (uint64) tx_ring;
   if(sizeof(tx_ring) % 128 != 0)
     panic("e1000");
@@ -53,9 +58,11 @@ e1000_init(uint32 *xregs)
   // [E1000 14.4] Receive initialization
   memset(rx_ring, 0, sizeof(rx_ring));
   for (i = 0; i < RX_RING_SIZE; i++) {
-    rx_ring[i].addr = (uint64) kalloc();
-    if (!rx_ring[i].addr)
+    rx_bufs[i] = kalloc();
+    if (rx_bufs[i] == 0)
       panic("e1000");
+    rx_ring[i].addr = (uint64) rx_bufs[i];
+    rx_ring[i].status = 0;
   }
   regs[E1000_RDBAL] = (uint64) rx_ring;
   if(sizeof(rx_ring) % 128 != 0)
@@ -93,33 +100,70 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(char *buf, int len)
 {
-  //
-  // Your code here.
-  //
-  // buf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after send completes.
-  //
-  // return 0 on success.
-  // return -1 on failure (e.g., there is no descriptor available)
-  // so that the caller knows to free buf.
-  //
+  acquire(&e1000_lock);
 
-  
+  uint32 idx = regs[E1000_TDT] % TX_RING_SIZE;
+
+  if ((tx_ring[idx].status & E1000_TXD_STAT_DD) == 0) {
+    release(&e1000_lock);
+    return -1;
+  }
+  if (tx_bufs[idx]) {
+    kfree(tx_bufs[idx]);
+    tx_bufs[idx] = 0;
+  }
+
+  tx_ring[idx].addr = (uint64)buf;
+  tx_ring[idx].length = len;
+  tx_ring[idx].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS; 
+  tx_ring[idx].status = 0; 
+
+  tx_bufs[idx] = buf;
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+
+  release(&e1000_lock);
   return 0;
 }
+
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver a buf for each packet (using net_rx()).
-  //
+  acquire(&e1000_lock);
+  uint32 idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
 
+  while (rx_ring[idx].status & E1000_RXD_STAT_DD) {
+    if ((rx_ring[idx].status & E1000_RXD_STAT_EOP) == 0) {
+      rx_ring[idx].status = 0;
+      regs[E1000_RDT] = idx;
+      idx = (idx + 1) % RX_RING_SIZE;
+      continue;
+    }
+
+    char *buf = (char *)rx_ring[idx].addr;
+    int len = rx_ring[idx].length;
+    char *newbuf = kalloc();
+    if(newbuf == 0){
+      break;
+    }
+
+    rx_bufs[idx] = newbuf;
+    rx_ring[idx].addr = (uint64)newbuf;
+    rx_ring[idx].status = 0;
+    release(&e1000_lock);
+    net_rx(buf, len);
+    acquire(&e1000_lock);
+
+    regs[E1000_RDT] = idx;
+
+    idx = (idx + 1) % RX_RING_SIZE;
+  }
+
+  release(&e1000_lock);
 }
+
+
+
 
 void
 e1000_intr(void)
@@ -128,6 +172,5 @@ e1000_intr(void)
   // without this the e1000 won't raise any
   // further interrupts.
   regs[E1000_ICR] = 0xffffffff;
-
   e1000_recv();
 }
