@@ -199,6 +199,7 @@ UPROGS=\
 	$U/_TXonly\
 	$U/_step5\
 	$U/_bindTest\
+	$U/_TestScenario\
 
 
 ifeq ($(LAB),util)
