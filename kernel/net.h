@@ -125,3 +125,19 @@ struct dns_data {
   uint32 ttl;
   uint16 len;
 } __attribute__((packed));
+
+
+// *ICMP*
+#define ICMP_DST_UNREACH 3 // Type 3: Destination Unreachable
+#define ICMP_ECHO       8
+#define ICMP_ECHO_REPLY 0
+#define ICMP_QUENCH      4
+#define ICMP_TIME_EXCEED 11
+
+// ICMP Packet Header
+struct icmp {
+  uint8 type;
+  uint8 code;
+  uint16 checksum;
+  uint32 unused; // For error messages, this 4 bytes is unused/reserved
+} __attribute__((packed));

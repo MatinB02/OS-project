@@ -35,6 +35,7 @@ struct udp_queue {
   struct udp_packet pkts[UDPQSIZE];
   int r;
   int w;
+  int err; // Flag to indicate a network error occurred *ICMP*
 };
 
 static struct udp_queue udp_ports[NUDPPORT];
@@ -49,10 +50,9 @@ netinit(void)
     udp_ports[i].bound = 0;
     udp_ports[i].r = 0;
     udp_ports[i].w = 0;
+    udp_ports[i].err = 0;     // *ICMP*
   }
 }
-
-
 
 //
 // bind(int port)
@@ -142,7 +142,20 @@ sys_recv(void)
   acquire(&q->lock);
 
   while(q->r == q->w){
+    // CHECK FOR ERROR BEFORE SLEEPING
+    if(q->err){
+      q->err = 0; // Clear the error so next call works
+      release(&q->lock);
+      return -1; // Return error to user
+    }
     sleep(q, &q->lock);
+  }
+  
+  // CHECK FOR ERROR AFTER WAKING UP
+  if(q->err){
+    q->err = 0;
+    release(&q->lock);
+    return -1;
   }
 
   struct udp_packet *p = &q->pkts[q->r % UDPQSIZE];
@@ -166,7 +179,6 @@ sys_recv(void)
 
   return n;
 }
-
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
 // of the University of California.
@@ -267,6 +279,117 @@ sys_send(void)
   return 0;
 }
 
+// *ICMP*
+static void
+icmp_send_reply(char *buf)
+{
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+  int ip_hlen = (ip->ip_vhl & 0x0f) * 4;
+  struct icmp *icmp = (struct icmp *)((char *)ip + ip_hlen);
+
+  // 1. Swap Ethernet addresses
+  uint8 tmp_mac[ETHADDR_LEN];
+  memmove(tmp_mac, eth->shost, ETHADDR_LEN);
+  memmove(eth->shost, eth->dhost, ETHADDR_LEN);
+  memmove(eth->dhost, tmp_mac, ETHADDR_LEN);
+
+  // 2. Swap IP addresses
+  uint32 tmp_ip = ip->ip_src;
+  ip->ip_src = ip->ip_dst;
+  ip->ip_dst = tmp_ip;
+
+  // 3. Change ICMP type to Reply and update Checksum
+  icmp->type = ICMP_ECHO_REPLY;
+  icmp->checksum = 0;
+  // Recalculate checksum over the ICMP header and data
+  int icmp_len = ntohs(ip->ip_len) - ip_hlen;
+  icmp->checksum = in_cksum((unsigned char *)icmp, icmp_len);
+
+  // 4. Transmit the modified buffer
+  e1000_transmit(buf, sizeof(struct eth) + ntohs(ip->ip_len));
+}
+
+// *ICMP*
+static int
+notify_socket_error(char *buf)
+{
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+  int ip_hlen = (ip->ip_vhl & 0x0f) * 4;
+  struct icmp *icmp = (struct icmp *)((char *)ip + ip_hlen);
+
+  struct ip *inner_ip = (struct ip *)((char *)icmp + 8);
+  int inner_ip_hlen = (inner_ip->ip_vhl & 0x0f) * 4;
+  struct udp *inner_udp = (struct udp *)((char *)inner_ip + inner_ip_hlen);
+  
+  uint16 local_port = ntohs(inner_udp->dport);
+  int handled = 0;
+
+  if(local_port < NUDPPORT){
+    struct udp_queue *q = &udp_ports[local_port];
+    acquire(&q->lock);
+    if(q->bound){
+      q->err = 1;
+      wakeup(q); 
+      handled = 1; // Successfully matched to a listening app
+    }
+    release(&q->lock);
+  }
+  return handled;
+}
+
+// *ICMP*
+void
+icmp_rx(char *buf, int len)
+{
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+  int ip_hlen = (ip->ip_vhl & 0x0f) * 4;
+  
+  if (len < sizeof(struct eth) + ip_hlen + 8) {
+    printf("icmp_rx: packet too short (%d bytes), dropping\n", len);
+    kfree(buf);
+    return;
+  }
+
+  struct icmp *icmp = (struct icmp *)((char *)ip + ip_hlen);
+  int success = 0;
+
+  switch(icmp->type) {
+    case ICMP_ECHO:
+      printf("icmp_rx: ECHO REQUEST received -> sending reply\n");
+      icmp_send_reply(buf);
+      return; // Return early; buf is kfreed after transmission
+
+    case ICMP_DST_UNREACH:
+      success = notify_socket_error(buf);
+      if(success)
+        printf("icmp_rx: DEST UNREACHABLE handled (notified port)\n");
+      else
+        printf("icmp_rx: DEST UNREACHABLE ignored (no bound port found)\n");
+      break;
+
+    case ICMP_TIME_EXCEED:
+      success = notify_socket_error(buf);
+      if(success)
+        printf("icmp_rx: TTL EXPIRED handled (notified port)\n");
+      else
+        printf("icmp_rx: TTL EXPIRED ignored\n");
+      break;
+
+    case ICMP_QUENCH:
+      success = notify_socket_error(buf);
+      printf("icmp_rx: SOURCE QUENCH received (throttling: %s)\n", success ? "OK" : "IGNORED");
+      break;
+
+    default:
+      printf("icmp_rx: unhandled type %d - dropping\n", icmp->type);
+      break;
+  }
+
+  kfree(buf);
+}
 
 void
 ip_rx(char *buf, int len)
@@ -284,6 +407,14 @@ ip_rx(char *buf, int len)
   struct eth *eth = (struct eth *)buf;
   struct ip *ip = (struct ip *)(eth + 1);
 
+  // handle ICMP errorz
+  if(ip->ip_p == IPPROTO_ICMP){
+    printf("ip_rx: detected ICMP packet!\n");
+    icmp_rx(buf, len); // Call the *ICMP* function
+    return;
+  }
+
+  // drop non-udp packets
   if(ip->ip_p != IPPROTO_UDP){
     kfree(buf);
     return;
@@ -402,6 +533,7 @@ arp_rx(char *inbuf)
 void
 net_rx(char *buf, int len)
 {
+  printf("net_rx: received packet len %d\n", len);
   struct eth *eth = (struct eth *) buf;
 
   if(len >= sizeof(struct eth) + sizeof(struct arp) &&

@@ -9,7 +9,7 @@ static void
 send_msg(const char *s)
 {
   int n = strlen(s);
-  if(send(1111, HOSTIP, HOSTPORT, (char*)s, n) < 0){
+  if(send(MYPORT, HOSTIP, HOSTPORT, (char*)s, n) < 0){
     printf("fullnet: send failed\n");
     exit(1);
   }
